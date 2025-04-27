@@ -5,58 +5,71 @@ const JWT_SECRET = 'myultrasecretkey12345'; // (later we hide this better)
 const express = require('express');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
-const Database = require('better-sqlite3');
+const sqlite3 = require('sqlite3').verbose(); // ✅ Updated to sqlite3
 
 // 2. Create an Express app
 const app = express();
 app.use(express.json()); // To automatically parse JSON bodies
 
 // 3. Connect to SQLite database
-const db = new Database('soc2.db');
-
-// 4. Create users table if it doesn't exist
-db.prepare(`
-  CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    email TEXT UNIQUE,
-    password TEXT,
-    phone TEXT,
-    bio TEXT
-  )
-`).run();
-
-// 5. Register Route
-app.post('/api/register', async (req, res) => {
-  const { email, password } = req.body;
-
-  const userExists = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
-  if (userExists) {
-    return res.status(400).json({ error: 'User already exists' });
+const db = new sqlite3.Database('soc2.db', (err) => {
+  if (err) {
+    console.error('Database connection error:', err);
+  } else {
+    console.log('Connected to SQLite database');
   }
-
-  const hashedPassword = await bcrypt.hash(password, 10);
-
-  db.prepare('INSERT INTO users (email, password) VALUES (?, ?)').run(email, hashedPassword);
-
-  res.json({ message: 'User registered successfully' });
 });
 
-// 6. Login Route (with JWT token)
-app.post('/api/login', async (req, res) => {
+// 4. Create users table if it doesn't exist
+db.serialize(() => {
+  db.run(`
+    CREATE TABLE IF NOT EXISTS users (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      email TEXT UNIQUE,
+      password TEXT,
+      phone TEXT,
+      bio TEXT
+    )
+  `);
+});
+
+// 5. Register Route
+app.post('/api/register', (req, res) => {
   const { email, password } = req.body;
 
-  const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
-  if (!user) {
-    return res.status(401).json({ error: 'Invalid email or password' });
-  }
+  db.get('SELECT * FROM users WHERE email = ?', [email], async (err, user) => {
+    if (user) {
+      return res.status(400).json({ error: 'User already exists' });
+    }
 
-  const isMatch = await bcrypt.compare(password, user.password);
-  if (isMatch) {
-    const token = jwt.sign({ email: user.email }, JWT_SECRET, { expiresIn: '1h' });
-    res.json({ message: 'Login successful', token });
-  } else {
-    res.status(401).json({ error: 'Invalid email or password' });
-  }
+    const hashedPassword = await bcrypt.hash(password, 10);
+
+    db.run('INSERT INTO users (email, password) VALUES (?, ?)', [email, hashedPassword], (err) => {
+      if (err) {
+        return res.status(500).json({ error: 'Registration failed' });
+      }
+      res.json({ message: 'User registered successfully' });
+    });
+  });
+});
+
+// 6. Login Route
+app.post('/api/login', (req, res) => {
+  const { email, password } = req.body;
+
+  db.get('SELECT * FROM users WHERE email = ?', [email], async (err, user) => {
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid email or password' });
+    }
+
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (isMatch) {
+      const token = jwt.sign({ email: user.email }, JWT_SECRET, { expiresIn: '1h' });
+      res.json({ message: 'Login successful', token });
+    } else {
+      res.status(401).json({ error: 'Invalid email or password' });
+    }
+  });
 });
 
 // 7. Protected Profile Route
@@ -68,13 +81,13 @@ app.get('/api/profile', (req, res) => {
 
   try {
     const decoded = jwt.verify(token, JWT_SECRET);
-    const user = db.prepare('SELECT email, phone, bio FROM users WHERE email = ?').get(decoded.email);
 
-    if (!user) {
-      return res.status(404).json({ error: 'User not found' });
-    }
-
-    res.json({ user });
+    db.get('SELECT email, phone, bio FROM users WHERE email = ?', [decoded.email], (err, user) => {
+      if (!user) {
+        return res.status(404).json({ error: 'User not found' });
+      }
+      res.json({ user });
+    });
   } catch (error) {
     res.status(401).json({ error: 'Invalid token' });
   }
@@ -91,10 +104,12 @@ app.put('/api/profile', (req, res) => {
     const decoded = jwt.verify(token, JWT_SECRET);
     const { phone, bio } = req.body;
 
-    db.prepare('UPDATE users SET phone = ?, bio = ? WHERE email = ?')
-      .run(phone, bio, decoded.email);
-
-    res.json({ message: 'Profile updated successfully' });
+    db.run('UPDATE users SET phone = ?, bio = ? WHERE email = ?', [phone, bio, decoded.email], function (err) {
+      if (err) {
+        return res.status(500).json({ error: 'Update failed' });
+      }
+      res.json({ message: 'Profile updated successfully' });
+    });
   } catch (error) {
     res.status(401).json({ error: 'Invalid token' });
   }
@@ -111,24 +126,31 @@ app.put('/api/reset-password', async (req, res) => {
     const decoded = jwt.verify(token, JWT_SECRET);
     const { oldPassword, newPassword } = req.body;
 
-    const user = db.prepare('SELECT * FROM users WHERE email = ?').get(decoded.email);
+    db.get('SELECT * FROM users WHERE email = ?', [decoded.email], async (err, user) => {
+      if (!user) {
+        return res.status(404).json({ error: 'User not found' });
+      }
 
-    const isMatch = await bcrypt.compare(oldPassword, user.password);
-    if (!isMatch) {
-      return res.status(400).json({ error: 'Old password incorrect' });
-    }
+      const isMatch = await bcrypt.compare(oldPassword, user.password);
+      if (!isMatch) {
+        return res.status(400).json({ error: 'Old password incorrect' });
+      }
 
-    const newHashedPassword = await bcrypt.hash(newPassword, 10);
-    db.prepare('UPDATE users SET password = ? WHERE email = ?')
-      .run(newHashedPassword, decoded.email);
+      const newHashedPassword = await bcrypt.hash(newPassword, 10);
 
-    res.json({ message: 'Password reset successfully' });
+      db.run('UPDATE users SET password = ? WHERE email = ?', [newHashedPassword, decoded.email], function (err) {
+        if (err) {
+          return res.status(500).json({ error: 'Password reset failed' });
+        }
+        res.json({ message: 'Password reset successfully' });
+      });
+    });
   } catch (error) {
     res.status(401).json({ error: 'Invalid token' });
   }
 });
 
-// 10. Logout Route (handled client-side)
+// 10. Logout Route
 app.post('/api/logout', (req, res) => {
   res.json({ message: 'Logout successful. Please delete your token client-side.' });
 });
@@ -139,6 +161,7 @@ app.get('/api/status', (req, res) => {
 });
 
 // 12. Start server
-app.listen(3000, () => {
-  console.log('Server running at http://localhost:3000');
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`Server running at http://localhost:${PORT}`);
 });
